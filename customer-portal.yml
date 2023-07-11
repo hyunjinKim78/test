@@ -1,4 +1,4 @@
-name: welcome to jiniworld
+name: welcome to jiniworld2
 
 on:
   repository_dispatch:
