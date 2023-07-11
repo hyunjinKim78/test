@@ -1,0 +1,32 @@
+name: sonarqube test
+on:
+  push:
+    branches: [ "improve/sonar-qube" ]
+  #   #paths-ignore:
+  #    #- '.github/**'
+  # pull_request:
+  #   branches: [ "main" ]
+  repository_dispatch:
+    types: [test_cp]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+   
+      - name: sonar_test
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: 38821072d9625bf7a2054bce4924dd22767eff63
+          SONAR_HOST_URL: http://sonarqube.imip.ml
+        # If you wish to fail your job when the Quality Gate is red, uncomment the
+        # following lines. This would typically be used to fail a deployment.
+      - uses: sonarsource/sonarqube-quality-gate-action@master
+        name: quality_gate
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: 38821072d9625bf7a2054bce4924dd22767eff63

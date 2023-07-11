@@ -1,0 +1,167 @@
+name: build customer portal 
+
+on:
+  repository_dispatch:
+    types: [build_customer_portal]
+  schedule:
+    - cron: '0 20 * * 0-4'
+  workflow_dispatch:
+    inputs:
+      version:
+        required: false
+        description: 'Service Version'
+        default: '1.0.0'
+      repo:
+        required: false
+        description: 'S3 bucket Name'
+        default: 's3://secui.sase.repo.dev/customer_portal'
+      aws_region:
+        required: false
+        description: 'AWS Region'
+        default: 'ap-northeast-2'
+      ref:
+        required: false
+        description: 'Git commit sha'
+        default: ''
+      yarn:
+        required: false
+        description: 'Name of Yarn.lock'
+        default: 'yarn.lock.be42b74.20230421'
+
+
+permissions:
+  id-token: write   # This is required for requesting the JWT
+  contents: write   # This is required for actions/checkout
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04	
+
+    steps:
+      - name: set env
+        id : set_env
+        shell: bash
+        run: |
+            if [ "${{ github.event_name }}" == "repository_dispatch" ]
+            then
+                TMP_VERSION="${{ github.event.client_payload.version }}"
+                TMP_REPO="${{ github.event.client_payload.repo }}"
+                TMP_REGION="${{ github.event.client_payload.aws_region }}"
+                TMP_REF="${{ github.event.client_payload.ref}}"
+                TMP_YARN="${{ github.event.client_payload.yarn}}"
+            fi
+
+            if [ "${{ github.event_name }}" == "workflow_dispatch" ]
+            then
+                TMP_VERSION="${{ github.event.inputs.version }}"
+                TMP_REPO="${{ github.event.inputs.repo }}"
+                TMP_REGION="${{ github.event.inputs.aws_region }}"
+                TMP_REF="${{ github.event.inputs.ref}}"
+                TMP_YARN="${{ github.event.inputs.yarn}}"
+            fi
+
+            if [ "${{ github.event_name }}" == "schedule" ]
+            then
+                TMP_VERSION="1.0.0"
+                TMP_REPO="s3://secui.sase.repo.dev/customer_portal"
+                TMP_REGION="ap-northeast-2"
+                TMP_REF=""
+                TMP_YARN="yarn.lock.be42b74.20230421"
+            fi
+
+
+            echo "VERSION=`echo $TMP_VERSION`" >> $GITHUB_ENV
+            echo "REPO=`echo $TMP_REPO`" >> $GITHUB_ENV
+            echo "REGION=`echo $TMP_REGION`" >> $GITHUB_ENV
+            echo "REF=`echo $TMP_REF`" >> $GITHUB_ENV
+            echo "YARN_FILE=`echo $TMP_YARN`" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::367918691398:role/github_action_role_vpc_ec2_full
+          role-session-name: build_cm_output_rsession
+          aws-region: ${{ env.REGION }}
+
+      - name: checkout_src
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ env.REF }}
+
+      - name: install node modules
+        id : install_node_modules
+        run: |
+            sudo gem install apt-spy2
+            sudo apt-spy2 check
+            sudo apt-spy2 fix --commit
+            # after selecting a specific mirror, we need to run 'apt-get update'
+            sudo apt-get update
+            sudo apt-get -y install nodejs npm nginx
+            sudo npm cache clean -f
+            sudo npm install -g n
+            sudo n 16.17.0
+            hash -r
+            node -v
+            npm install --global yarn
+
+            if [ "${{ env.YARN_FILE }}" != "" ]
+            then
+                cp ./package_json/${{ env.YARN_FILE }} ./yarn.lock
+                yarn install --frozen-lockfile
+            else
+                yarn install
+            fi
+
+            SHORT_SHA=$(cat ./yarn.lock | sha256sum | awk {'print $1'} | cut -c1-7)
+            FORMAT_DATE=$(date "+%Y%m%d")
+            COUNT=$(find ./package_json/ -name yarn.lock.${SHORT_SHA}.* | wc -l)
+
+            echo "yarn.lock.${SHORT_SHA}"
+            echo "file_count = ${COUNT}"
+            echo "update_yarn=0" >> $GITHUB_OUTPUT
+            if [ "${COUNT}" == "0" ]
+            then
+                cp ./yarn.lock ./package_json/yarn.lock.${SHORT_SHA}.${FORMAT_DATE}
+                git add ./package_json/yarn.lock.${SHORT_SHA}.${FORMAT_DATE}
+                git add ./yarn.lock
+                echo "update_yarn=1" >> $GITHUB_OUTPUT
+            fi
+
+            echo "YARN_SHORT_SHA=`echo $SHORT_SHA`" >> $GITHUB_ENV
+
+      - name: build module
+        run: |
+            cp .env_example .env
+            cp .env_example ./src/app/.env
+            npm run prod
+            ls -al ./dist
+            echo $(git log -n 1 --pretty=format:"%H") > ./dist/commit_sha
+            echo "${{ env.YARN_SHORT_SHA }}" >> ./dist/commit_sha
+
+            mv ./dist ./customer_portal_${{ env.VERSION }}
+            tar -zcvf ./customer_portal_${{ env.VERSION }}.tar.gz ./customer_portal_${{ env.VERSION }}
+
+            aws s3 cp ./customer_portal_${{ env.VERSION }}.tar.gz ${{ env.REPO }}/${{ env.VERSION }}/customer_portal_${{ env.VERSION }}.tar.gz
+
+      - name: aws sns publish to slack
+        id : aws_sns_pub_slack
+        run: |
+            COMMIT_SHA=$(git log -n 1 --pretty=format:"%H")
+            TARBALL_BASE_INFO="\"type\":\"TARBALL\", \"name\":\"customer_portal\", \"state\": { \"status\": \"AVAILABLE\" }"
+            MESSAGE="{ ${TARBALL_BASE_INFO} , \"outputResources\": { \"tarball\": [ { \"commit_sha\": \"${COMMIT_SHA}\", \"bucket\": \"${{ env.REPO }}\", \"accountId\": \"367918691398\", \"name\": \"${{ env.VERSION }}/customer_portal_${{ env.VERSION }}.tar.gz\" } ] } }"
+            aws sns publish --topic-arn "arn:aws:sns:ap-northeast-2:367918691398:slack-sase-devops" --message "${MESSAGE}"
+        shell: bash
+
+      - name: git push
+        id : git_push
+        if : steps.install_node_modules.outputs.update_yarn == 1
+        run: |
+            FORMAT_DATE=$(date "+%Y%m%d")
+
+            git config --global user.name 'secui.sase-dev'
+            git config --global user.email 'secui.sase-dev@secui.com'
+            git commit -am "update ./package_json/yarn.lock.${{ env.YARN_SHORT_SHA }}.${FORMAT_DATE}"
+
+            git pull -r
+            git push origin
+ 
